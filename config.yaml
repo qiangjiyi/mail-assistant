@@ -1,0 +1,147 @@
+# 邮箱整理助手 - 主配置文件
+# 注意：敏感信息请在 .env 文件中配置
+
+app:
+  name: "邮箱整理助手"
+  version: "1.0.0"
+  debug: false
+  log_level: "INFO"
+
+# 数据库配置
+database:
+  path: "./data/mail_assistant.db"
+  backup_enabled: true
+  backup_interval_hours: 24
+  cleanup:
+    enabled: true
+    interval_hours: 24
+    processed_emails_retention_days: 180
+    logs_retention_days: 30
+
+# 邮箱账户配置
+accounts:
+  - name: "163工作邮箱"
+    provider: "163"
+    email: "{{EMAIL_163_WORK}}"
+    imap_host: "imap.163.com"
+    imap_port: 993
+    username: "{{IMAP_USER_163_WORK}}"
+    password: "{{IMAP_PASS_163_WORK}}"
+    folder_prefix: "工作/"
+    fetch_interval_seconds: 60
+    initial_days: 30
+    batch_size: 50
+    batch_delay_seconds: 5
+    enabled: true
+
+  - name: "163私人邮箱"
+    provider: "163"
+    email: "{{EMAIL_163_PERSONAL}}"
+    imap_host: "imap.163.com"
+    imap_port: 993
+    username: "{{IMAP_USER_163_PERSONAL}}"
+    password: "{{IMAP_PASS_163_PERSONAL}}"
+    folder_prefix: "私人/"
+    fetch_interval_seconds: 60
+    initial_days: 30
+    batch_size: 50
+    batch_delay_seconds: 5
+    enabled: true
+
+  - name: "Gmail邮箱"
+    provider: "gmail"
+    email: "{{EMAIL_GMAIL}}"
+    imap_host: "imap.gmail.com"
+    imap_port: 993
+    username: "{{IMAP_USER_GMAIL}}"
+    password: "{{IMAP_PASS_GMAIL}}"
+    folder_prefix: "Gmail/"
+    idle_timeout_seconds: 540
+    reconnect_timeout_seconds: 1800
+    initial_days: 30
+    batch_size: 50
+    batch_delay_seconds: 5
+    enabled: true
+
+# IMAP操作配置
+imap:
+  operation_timeout_seconds: 30
+
+# AI分类配置
+ai:
+  provider: "llm"
+  # 留空时从环境变量读取：LLM_API_BASE / LLM_MODEL / LLM_API_KEY。
+  base_url: ""
+  model: ""
+  api_key: ""
+  temperature: 0.1
+  max_tokens: 500
+  timeout_seconds: 30
+  retry_attempts: 3
+  retry_delay_seconds: 2
+  
+  classification:
+    default_category: "个人事务"
+    confidence_threshold: 0.70
+    batch_window_seconds: 300
+    stock_batch_size: 5
+
+# 分类标签定义
+categories:
+  - "工作沟通"
+  - "通知提醒"
+  - "垃圾邮件"
+  - "社交动态"
+  - "个人事务"
+  - "技术·文档"
+
+# 分类映射到文件夹（按邮箱类型区分）
+category_folders:
+  # Gmail 文件夹格式
+  gmail:
+    "工作沟通": "工作沟通"
+    "通知提醒": "通知提醒"
+    "垃圾邮件": "[Gmail]/Spam"
+    "社交动态": "社交动态"
+    "个人事务": "个人事务"
+    "技术·文档": "技术文档"
+  # 163 文件夹格式
+  "163":
+    "工作沟通": "工作沟通"
+    "通知提醒": "通知提醒"
+    "垃圾邮件": "已删除"
+    "社交动态": "社交动态"
+    "个人事务": "个人事务"
+    "技术·文档": "技术文档"
+
+# 飞书通知配置
+feishu:
+  enabled: true
+  webhook_url: "{{FEISHU_WEBHOOK_URL}}"
+  secret: "{{FEISHU_WEBHOOK_SECRET}}"
+  security:
+    keyword_filter_enabled: true
+    blocked_keywords: []
+    hmac_enabled: true
+  card_template:
+    theme_color: "#1677ff"
+    width: 500
+
+# 归档配置
+archive:
+  enabled: true
+  default_folder: "[Gmail]/收件箱"
+  auto_create_folders: true
+
+# 重连策略
+reconnect:
+  max_attempts: 10
+  base_delay_seconds: 1
+  max_delay_seconds: 300
+  exponential_base: 2
+
+# 邮件抓取配置
+fetcher:
+  process_existing: true
+  body_preview_length: 200
+  body_secondary_length: 300
