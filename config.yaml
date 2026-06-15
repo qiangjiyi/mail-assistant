@@ -27,7 +27,7 @@ accounts:
     imap_port: 993
     username: "{{IMAP_USER_163_WORK}}"
     password: "{{IMAP_PASS_163_WORK}}"
-    folder_prefix: "工作/"
+    folder_prefix: ""
     fetch_interval_seconds: 60
     initial_days: 30
     batch_size: 50
@@ -41,7 +41,7 @@ accounts:
     imap_port: 993
     username: "{{IMAP_USER_163_PERSONAL}}"
     password: "{{IMAP_PASS_163_PERSONAL}}"
-    folder_prefix: "私人/"
+    folder_prefix: ""
     fetch_interval_seconds: 60
     initial_days: 30
     batch_size: 50
@@ -55,7 +55,7 @@ accounts:
     imap_port: 993
     username: "{{IMAP_USER_GMAIL}}"
     password: "{{IMAP_PASS_GMAIL}}"
-    folder_prefix: "Gmail/"
+    folder_prefix: ""
     idle_timeout_seconds: 540
     reconnect_timeout_seconds: 1800
     initial_days: 30
@@ -101,7 +101,9 @@ category_folders:
   gmail:
     "工作沟通": "工作沟通"
     "通知提醒": "通知提醒"
-    "垃圾邮件": "[Gmail]/Spam"
+    # 实际归档走 \Junk special-use（中文界面 = [Gmail]/垃圾邮件），
+    # 这里只是 special-use 探测失败时的 fallback。
+    "垃圾邮件": "[Gmail]/垃圾邮件"
     "社交动态": "社交动态"
     "个人事务": "个人事务"
     "技术·文档": "技术文档"

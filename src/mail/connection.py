@@ -65,6 +65,8 @@ class ConnectionState:
     last_connected: Optional[float] = None
     last_error: Optional[str] = None
     reconnect_count: int = 0
+    last_idle_heartbeat: float = 0.0
+    restart_in_progress: bool = False
 
 
 class IMAPConnection:
@@ -281,11 +283,7 @@ class IMAPConnection:
             return False
         
         try:
-            # INBOX 是 IMAP 保留名，不需要加前缀
-            if folder.upper() == "INBOX":
-                folder_with_prefix = folder
-            else:
-                folder_with_prefix = f"{self.account.folder_prefix}{folder}" if self.account.folder_prefix else folder
+            folder_with_prefix = self._apply_prefix(folder)
             result = await asyncio.wait_for(
                 self._connection.select(self._format_mailbox_name(folder_with_prefix)),
                 timeout=self._operation_timeout,
@@ -321,9 +319,12 @@ class IMAPConnection:
             return False
 
         try:
-            result = await self._connection.status(
-                self._format_mailbox_name(folder),
-                "(MESSAGES)",
+            result = await asyncio.wait_for(
+                self._connection.status(
+                    self._format_mailbox_name(self._apply_prefix(folder)),
+                    "(MESSAGES)",
+                ),
+                timeout=self._operation_timeout,
             )
             return result.result == "OK"
         except Exception as e:
@@ -454,23 +455,26 @@ class IMAPConnection:
     async def move_email(self, uid: str, target_folder: str) -> bool:
         """
         移动邮件到目标文件夹
-        
+
         Args:
             uid: 邮件UID
             target_folder: 目标文件夹
-            
+
         Returns:
             移动是否成功
         """
         if not self.is_connected:
             return False
-        
+
         try:
-            mailbox = self._format_mailbox_name(target_folder)
+            mailbox = self._format_mailbox_name(self._apply_prefix(target_folder))
 
             # Gmail 和不支持 MOVE 扩展的服务器使用 COPY + STORE 删除
             if self.account.provider == "gmail" or not self._supports_move():
-                result = await self._connection.uid("COPY", uid, mailbox)
+                result = await asyncio.wait_for(
+                    self._connection.uid("COPY", uid, mailbox),
+                    timeout=self._operation_timeout,
+                )
                 if result.result == "OK":
                     if not await self._delete_copied_source(uid):
                         logger.warning(f"邮件 {uid} 已复制到 {target_folder}，但源邮件删除失败")
@@ -484,34 +488,54 @@ class IMAPConnection:
                     return True
             else:
                 # 163等使用 MOVE 命令
-                result = await self._connection.uid("MOVE", uid, mailbox)
+                result = await asyncio.wait_for(
+                    self._connection.uid("MOVE", uid, mailbox),
+                    timeout=self._operation_timeout,
+                )
                 if result.result == "OK":
                     logger.info(f"邮件 {uid} 已移动到 {target_folder}")
                     return True
-            
+
             logger.warning(f"移动邮件 {uid} 失败: {result}")
             return False
-            
+
         except Exception as e:
             logger.error(f"移动邮件时出错: {e}")
             return False
 
     async def _delete_copied_source(self, uid: str) -> bool:
         """COPY 成功后删除源邮件。"""
-        store_result = await self._connection.uid(
-            "STORE",
-            uid,
-            "+FLAGS.SILENT",
-            "(\\Deleted)",
-        )
+        try:
+            store_result = await asyncio.wait_for(
+                self._connection.uid(
+                    "STORE",
+                    uid,
+                    "+FLAGS.SILENT",
+                    "(\\Deleted)",
+                ),
+                timeout=self._operation_timeout,
+            )
+        except Exception as e:
+            logger.warning(f"标记邮件 {uid} 删除超时或失败: {e}")
+            return False
         if store_result.result != "OK":
             logger.warning(f"标记邮件 {uid} 删除失败: {store_result}")
             return False
 
-        if self._supports_uidplus():
-            expunge_result = await self._connection.uid("EXPUNGE", uid)
-        else:
-            expunge_result = await self._connection.expunge()
+        try:
+            if self._supports_uidplus():
+                expunge_result = await asyncio.wait_for(
+                    self._connection.uid("EXPUNGE", uid),
+                    timeout=self._operation_timeout,
+                )
+            else:
+                expunge_result = await asyncio.wait_for(
+                    self._connection.expunge(),
+                    timeout=self._operation_timeout,
+                )
+        except Exception as e:
+            logger.warning(f"清除邮件 {uid} 超时或失败: {e}")
+            return False
 
         if expunge_result.result != "OK":
             logger.warning(f"清除邮件 {uid} 失败: {expunge_result}")
@@ -521,7 +545,14 @@ class IMAPConnection:
 
     async def _uid_exists_in_selected_folder(self, uid: str) -> bool:
         """检查 UID 是否仍存在于当前选中的文件夹。"""
-        result = await self._connection.uid_search(f"UID {uid}", charset=None)
+        try:
+            result = await asyncio.wait_for(
+                self._connection.uid_search(f"UID {uid}", charset=None),
+                timeout=self._operation_timeout,
+            )
+        except Exception as e:
+            logger.debug(f"检查邮件 {uid} 残留状态超时: {e}")
+            return False
         if result.result != "OK" or not result.lines:
             return False
 
@@ -554,25 +585,28 @@ class IMAPConnection:
     async def create_folder(self, folder: str) -> bool:
         """
         创建邮箱文件夹
-        
+
         Args:
             folder: 文件夹名称
-            
+
         Returns:
             创建是否成功
         """
         if not self.is_connected:
             return False
-        
+
         try:
-            result = await self._connection.create(self._format_mailbox_name(folder))
+            result = await asyncio.wait_for(
+                self._connection.create(self._format_mailbox_name(self._apply_prefix(folder))),
+                timeout=self._operation_timeout,
+            )
             if result.result == "OK":
                 logger.info(f"已创建文件夹: {folder}")
                 return True
             else:
                 logger.warning(f"创建文件夹失败: {result}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"创建文件夹时出错: {e}")
             return False
@@ -585,6 +619,17 @@ class IMAPConnection:
         encoded = self._encode_imap_utf7(folder)
         escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    def _apply_prefix(self, folder: str) -> str:
+        """对非 INBOX 文件夹拼上 account.folder_prefix。
+
+        select_folder/folder_exists/create_folder/move_email 共用，避免出现"select 走前缀、
+        其余命令不走前缀"的不一致——之前 163 配 folder_prefix='私人/' 时这个 bug 会让归档
+        命中错误的目录。
+        """
+        if folder.upper() == "INBOX" or not self.account.folder_prefix:
+            return folder
+        return f"{self.account.folder_prefix}{folder}"
 
     @staticmethod
     def _encode_imap_utf7(value: str) -> str:
@@ -654,35 +699,53 @@ class IMAPConnection:
         if self.account.provider != "gmail":
             logger.warning(f"{self.account.name} 不是Gmail，不支持IDLE模式")
             return
-        
+
         self._running = True
         idle_timeout = self.account.idle_timeout
-        
+        self._state.last_idle_heartbeat = 0.0
+        # IDLE 启动退避：连续失败指数退避，成功进入 IDLE 后清零。
+        # 没这个的话 idle() 失败分支会无间隔自旋，一秒刷上千条"进入IDLE状态"后死掉。
+        _MIN_REENTRY_DELAY = 5  # 每次重入 idle() 至少等 5s
+        _MAX_REENTRY_DELAY = 60
+        _reentry_delay = _MIN_REENTRY_DELAY
+        _last_idle_attempt = 0.0
+
         while self._running:
             try:
                 if not self.is_connected:
                     logger.info(f"{self.account.name} 重新连接...")
                     if not await self.reconnect():
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(_reentry_delay)
                         continue
-                    
+
                     await self.select_folder()
-                
+
+                # 退避：距离上次 idle() 尝试不足 _reentry_delay 就让出事件循环
+                now = time.time()
+                wait = _last_idle_attempt + _reentry_delay - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                _last_idle_attempt = time.time()
+
                 logger.debug(f"{self.account.name} 开始IDLE监听 (超时: {idle_timeout}秒)")
-                
+
                 # 发送 IDLE 命令
                 idle_result = await self._connection.idle()
                 if idle_result.result != "OK":
                     logger.warning(f"{self.account.name} 进入IDLE失败: {idle_result}")
-                    await asyncio.sleep(5)
+                    _reentry_delay = min(_reentry_delay * 2, _MAX_REENTRY_DELAY)
                     continue
-                
+                # 成功进入 IDLE：清零退避
+                _reentry_delay = _MIN_REENTRY_DELAY
+                self._state.last_idle_heartbeat = time.time()
+
                 # 等待IDLE响应或超时
                 try:
                     while self._running:
                         # 检查是否有新数据
                         response = await self._connection.wait_server_push(timeout=idle_timeout)
-                        
+
+                        self._state.last_idle_heartbeat = time.time()
                         if response:
                             # 解析 IDLE 响应
                             for line in getattr(response, "lines", []):
@@ -692,13 +755,14 @@ class IMAPConnection:
                                         logger.info(f"{self.account.name} 检测到新邮件")
                                         if self.on_new_mail:
                                             await self.on_new_mail([])
-                
+
                 except asyncio.TimeoutError:
                     # IDLE 超时，发送 NOOP 保持连接
+                    self._state.last_idle_heartbeat = time.time()
                     logger.debug(f"{self.account.name} IDLE超时，发送 NOOP")
                     self._connection.idle_done()
                     await self._connection.noop()
-                    
+
                     # 检查是否超时需要重连
                     if self._state.last_connected:
                         elapsed = time.time() - self._state.last_connected
@@ -712,22 +776,58 @@ class IMAPConnection:
                         self._connection.idle_done()
                     except Exception:
                         pass
-                
+
             except asyncio.CancelledError:
                 logger.info(f"{self.account.name} IDLE监听被取消")
                 break
             except Exception as e:
                 logger.error(f"{self.account.name} IDLE监听出错: {e}")
                 if self._running:
-                    await asyncio.sleep(5)
-        
+                    _reentry_delay = min(_reentry_delay * 2, _MAX_REENTRY_DELAY)
+                    await asyncio.sleep(_reentry_delay)
+
         logger.info(f"{self.account.name} IDLE监听结束")
-    
+
+    def mark_idle_unhealthy(self) -> None:
+        """看门狗检测到 IDLE 僵死时打上标记，由 force_restart_idle 清理。"""
+        self._state.restart_in_progress = True
+        self._state.last_idle_heartbeat = 0.0
+
+    def clear_idle_restart_flag(self) -> None:
+        """force_restart_idle 完成（成功或失败）后清掉标记，避免 watchdog 反复触发。"""
+        self._state.restart_in_progress = False
+
+    async def force_restart_idle(self) -> None:
+        """
+        看门狗调用：终止当前 IDLE 协程、断连、清状态，让外层用新 task 接管。
+
+        必须在 idle_listen 还没自然退出的情况下被调用。
+        """
+        self._state.restart_in_progress = True
+        try:
+            # 让 idle_listen 的外层 while 退出
+            self._running = False
+
+            # 强制断连（如果 idle() 阻塞在底层 socket，这里会把它打掉）
+            try:
+                if self._connection is not None:
+                    await asyncio.wait_for(
+                        self._connection.logout(),
+                        timeout=5,
+                    )
+            except Exception:
+                pass
+            self._state.connected = False
+            self._connection = None
+            self._state.last_connected = None
+        finally:
+            self.clear_idle_restart_flag()
+
     def start_idle(self) -> asyncio.Task:
         """启动IDLE监听任务"""
         if self._idle_task:
             self._idle_task.cancel()
-        
+
         self._idle_task = asyncio.create_task(self.idle_listen())
         return self._idle_task
 

@@ -161,11 +161,15 @@ class MailAssistantService:
         try:
             while self._running:
                 await asyncio.sleep(10)
-                
+
                 # 检查连接状态
                 if self._running:
                     await self._check_connections()
-                
+
+                # Gmail IDLE 看门狗（解决 aioimaplib 卡死导致 IDLE 永远不超时的问题）
+                if self._running:
+                    await self._check_idle_health()
+
         except asyncio.CancelledError:
             logger.info("服务被取消")
         finally:
@@ -219,17 +223,76 @@ class MailAssistantService:
         """启动邮件抓取器"""
         for email, fetcher in self._fetchers.items():
             account = fetcher.account
-            
+
             if account.provider == "gmail":
                 # Gmail使用IDLE模式
                 logger.info(f"{email} 启动IDLE模式")
-                task = asyncio.create_task(fetcher.start_idle())
-                self._tasks.append(task)
+                task = await fetcher.start_idle()
+                if task:
+                    self._tasks.append(task)
             else:
                 # 163使用轮询模式
                 logger.info(f"{email} 启动轮询模式")
                 task = fetcher.start_polling_task()
                 self._tasks.append(task)
+
+    async def _check_idle_health(self) -> None:
+        """
+        Gmail IDLE 看门狗：
+
+        IDLE 命令底层可能在 `idle()` 处无限阻塞（Gmail 静默断开后 aioimaplib 不返回也不抛异常），
+        这时 idle_timeout 永远不会触发。看门狗通过定期检查 last_idle_heartbeat 来发现僵死的 IDLE，
+        强制取消 task 并重启。
+        """
+        # 540s IDLE 超时 + 缓冲；保留至少一轮 NOOP 的余量
+        idle_stale_threshold = 12 * 60
+        # 看门狗重启循环熔断：300s 内 restart 超过这个次数 → 视为 watchdog 自己在死循环重启，
+        # 强制再重启一次（防止被同一份坏状态反复唤醒）。
+        # 阈值 3：用户场景是 1 Gmail + 1 轮询，正常时 watchdog 几乎不触发；
+        # 连续 3 次重启仍无心跳，说明底层问题持久，再多重启也是徒劳——保留信号给上层。
+        idle_restart_window_seconds = 300
+        idle_restart_threshold = 3
+        now = time.time()
+
+        for email, fetcher in list(self._fetchers.items()):
+            if fetcher.account.provider != "gmail":
+                continue
+
+            connection = fetcher.connection
+            last_beat = connection._state.last_idle_heartbeat
+            if last_beat <= 0:
+                # 还没建立过心跳，跳过
+                continue
+
+            if connection._state.restart_in_progress:
+                # 已经在重启流程中
+                continue
+
+            recent_restarts = fetcher.recent_idle_starts(idle_restart_window_seconds)
+
+            if now - last_beat <= idle_stale_threshold:
+                # 心跳还新鲜，但 watchdog 短时间内反复重启过，判定为重启循环
+                if recent_restarts > idle_restart_threshold:
+                    logger.warning(
+                        f"Gmail IDLE 看门狗重启循环 "
+                        f"({recent_restarts} 次/{idle_restart_window_seconds}s)，"
+                        f"强制再重启一次: {email}"
+                    )
+                else:
+                    continue
+            else:
+                logger.warning(
+                    f"Gmail IDLE 心跳超时 ({int(now - last_beat)}s 无心跳)，强制重启: {email}"
+                )
+            try:
+                new_task = await fetcher.restart_idle()
+                if new_task is None:
+                    continue
+                # 清理已结束的 task，把新 task 挂上去
+                self._tasks = [t for t in self._tasks if not t.done()]
+                self._tasks.append(new_task)
+            except Exception as e:
+                logger.error(f"重启 Gmail IDLE 失败 ({email}): {e}")
     
     async def _check_connections(self) -> None:
         """检查连接状态"""
@@ -314,6 +377,7 @@ class MailAssistantService:
         processed_emails = []
 
         for email_data in emails:
+            finalize = False  # 控制下半段（通知 + 计数）是否执行
             try:
                 # 检查是否已处理
                 existing_email = await self._database.get_email_by_message_id(email_data.message_id)
@@ -326,7 +390,11 @@ class MailAssistantService:
 
                         logger.info(f"已处理邮件仍在收件箱，尝试补归档: {email_data.subject[:30]}")
                         if self._archive_config.get("enabled", True):
-                            success = await self._archiver.archive_email(email_data)
+                            try:
+                                success = await self._archiver.archive_email(email_data)
+                            except Exception as e:
+                                logger.error(f"补归档异常: {email_data.subject[:30]}: {e}")
+                                success = False
                             if success:
                                 await self._database.mark_email_archived(
                                     message_id=email_data.message_id,
@@ -336,19 +404,19 @@ class MailAssistantService:
                     else:
                         logger.debug(f"邮件已处理且无归档目标，跳过: {email_data.subject[:30]}")
                     continue
-                
+
                 # 保存到数据库
                 await self._database.save_email(email_data)
-                
+
                 # AI分类
                 classification = await self._ai_classifier.classify_email_with_retry(email_data)
-                
+
                 # 规则增强
                 classification = self._rule_engine.enhance_ai_result(email_data, classification)
-                
+
                 # 更新分类结果
                 self._ai_classifier.apply_result_to_email(email_data, classification)
-                
+
                 # 更新数据库
                 await self._database.update_email_classification(
                     message_id=email_data.message_id,
@@ -356,28 +424,55 @@ class MailAssistantService:
                     confidence=email_data.ai_confidence,
                     summary=email_data.ai_summary,
                 )
-                
-                # 归档
+
+                # 归档（独立 try/except，失败不影响后续通知和计数）
+                archive_success = False
                 if self._archive_config.get("enabled", True):
-                    success = await self._archiver.archive_email(email_data)
-                    if success:
-                        await self._database.mark_email_archived(
-                            message_id=email_data.message_id,
-                            folder=email_data.archived_folder,
+                    try:
+                        archive_success = await self._archiver.archive_email(email_data)
+                    except Exception as e:
+                        logger.error(
+                            f"归档异常: {email_data.subject[:30]}: {type(e).__name__}: {e}"
                         )
-                
-                # 发送通知
-                if send_individual_notifications:
+                    if archive_success:
+                        try:
+                            await self._database.mark_email_archived(
+                                message_id=email_data.message_id,
+                                folder=email_data.archived_folder,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"标记归档失败: {email_data.subject[:30]}: {e}"
+                            )
+
+                finalize = True
+                processed_emails.append(email_data)
+
+            except Exception as e:
+                logger.error(f"处理邮件失败: {e}")
+                await self._state_manager.increment_errors()
+                continue
+
+            # ===== 下半段：通知 + 计数 =====
+            # 走到这里说明：分类、解析、DB 写入都成功。归档失败/超时不影响通知和计数。
+            if not finalize:
+                continue
+
+            if send_individual_notifications:
+                try:
                     await self._notifier.send_notification(email_data)
-                
-                # 更新状态
+                except Exception as e:
+                    # send_notification 内部已全捕获，这里再兜一层
+                    logger.error(
+                        f"发送通知异常: {email_data.subject[:30]}: {type(e).__name__}: {e}"
+                    )
+
+            try:
                 await self._state_manager.increment_processed()
                 await self._state_manager.set_last_uid(
                     email_data.account_email,
                     email_data.uid,
                 )
-                
-                # 记录日志
                 await self._database.log_operation(
                     level="INFO",
                     message=f"邮件处理完成: {email_data.subject}",
@@ -387,18 +482,17 @@ class MailAssistantService:
                         "category": email_data.ai_category,
                         "confidence": email_data.ai_confidence,
                         "folder": email_data.archived_folder,
-                    }
+                    },
                 )
-                
-                logger.info(
-                    f"✓ {email_data.subject[:40]}... -> "
-                    f"{email_data.ai_category} ({email_data.ai_confidence:.0%})"
-                )
-                processed_emails.append(email_data)
-                
             except Exception as e:
-                logger.error(f"处理邮件失败: {e}")
-                await self._state_manager.increment_errors()
+                logger.error(
+                    f"更新状态失败: {email_data.subject[:30]}: {type(e).__name__}: {e}"
+                )
+
+            logger.info(
+                f"✓ {email_data.subject[:40]}... -> "
+                f"{email_data.ai_category} ({email_data.ai_confidence:.0%})"
+            )
 
         return processed_emails
 

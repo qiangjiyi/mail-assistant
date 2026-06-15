@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
@@ -41,8 +42,13 @@ class MailFetcher:
         
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
+        self._idle_task: Optional[asyncio.Task] = None
         self._last_uid: Optional[str] = None
-        
+        # 频率熔断：跟踪 IDLE 启动时间戳，看门狗从这里也能识别"自旋"。
+        # 跟 connection 里的退避是两条独立防线——退避负责不再自旋，
+        # 熔断负责在退避失效时（代码 bug / 改坏）也能在 main 看门狗里被抓住。
+        self._idle_start_log: List[float] = []
+
         self._config = get_config()
         self._fetcher_config = self._config.fetcher
     
@@ -93,26 +99,80 @@ class MailFetcher:
         
         logger.info(f"{self.account.name} 轮询结束")
     
-    async def start_idle(self) -> None:
-        """开始IDLE模式（Gmail）"""
+    async def start_idle(self) -> asyncio.Task:
+        """开始IDLE模式（Gmail），返回后台 task 给上层管理生命周期。"""
         if self.account.provider != "gmail":
             logger.warning(f"{self.account.name} 不是Gmail，无法使用IDLE模式")
-            return
-        
+            return None
+
         self._running = True
-        
+
         # 设置回调
         self.connection.on_new_mail = self._on_idle_new_mail
         self.connection.on_idle_timeout = self._on_idle_timeout
-        
-        logger.info(f"{self.account.name} 开始IDLE模式")
-        
-        # 首次同步存量邮件
-        if self._fetcher_config.get("process_existing", True):
-            await self._fetch_existing_emails()
-        
-        # 开始IDLE监听
-        await self.connection.idle_listen()
+
+        logger.info(f"{self.account.name} 启动IDLE模式")
+
+        async def _run():
+            try:
+                # 首次同步存量邮件
+                if self._fetcher_config.get("process_existing", True):
+                    emails = await self._fetch_existing_emails()
+                    # 存量邮件解析后也要进入处理管线（分类/归档/通知），
+                    # 否则首次启动看到的存量会被静默丢弃。
+                    if emails and self.on_emails_fetched:
+                        await self.on_emails_fetched(emails)
+
+                # 开始IDLE监听（阻塞直到被 cancel 或自然结束）
+                await self.connection.idle_listen()
+            except asyncio.CancelledError:
+                logger.info(f"{self.account.name} IDLE task 被取消")
+                raise
+            finally:
+                self._running = False
+
+        self._idle_task = asyncio.create_task(_run(), name=f"idle:{self.account.email}")
+        self._record_idle_start()
+        return self._idle_task
+
+    def _record_idle_start(self) -> None:
+        """记录一次 IDLE 启动时间戳；main 看门狗用这个判断是否在自旋。"""
+        now = time.time()
+        self._idle_start_log.append(now)
+        # 只保留最近 5 分钟的样本，避免列表无限增长
+        cutoff = now - 300
+        self._idle_start_log = [t for t in self._idle_start_log if t >= cutoff]
+
+    def recent_idle_starts(self, window_seconds: int = 60) -> int:
+        """返回最近 window_seconds 秒内 IDLE 启动次数。"""
+        cutoff = time.time() - window_seconds
+        return sum(1 for t in self._idle_start_log if t >= cutoff)
+
+    async def restart_idle(self) -> asyncio.Task:
+        """
+        看门狗调用：取消当前 IDLE 任务，强制断连，重建新任务。
+
+        返回新 task，调用方需要把它替换到自己的 task 列表里。
+        """
+        logger.warning(f"{self.account.name} IDLE 心跳超时，看门狗强制重启")
+        self.connection.mark_idle_unhealthy()
+
+        # 取消旧 task
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # 断连、清状态
+        try:
+            await self.connection.force_restart_idle()
+        except Exception as e:
+            logger.error(f"{self.account.name} 强制断连失败: {e}")
+
+        # 起新 task（start_idle 内部会用 _running 重新置 True）
+        return await self.start_idle()
     
     async def _on_idle_new_mail(self, uids: List[str]) -> None:
         """IDLE模式检测到新邮件"""
