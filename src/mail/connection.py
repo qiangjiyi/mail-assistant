@@ -6,6 +6,7 @@ IMAP连接管理模块
 import asyncio
 import base64
 import re
+import socket
 import ssl
 import time
 from dataclasses import dataclass, field
@@ -100,6 +101,7 @@ class IMAPConnection:
         config = get_config()
         self._reconnect_config = config.reconnect
         self._operation_timeout = config.get("imap.operation_timeout_seconds", 30)
+        self._connect_timeout = config.get("imap.connect_timeout_seconds", 60)
     
     @property
     def is_connected(self) -> bool:
@@ -142,7 +144,27 @@ class IMAPConnection:
             )
 
             await self._send_client_id_if_required()
-            
+
+            # 设置 TCP keepalive：NAT/防火墙会杀掉空闲 TCP 连接，
+            # keepalive 每 60s 发探测包，3 次无响应判定断开。
+            try:
+                transport = self._connection.protocol.transport
+                sock = transport.get_extra_info('socket')
+                if sock is not None:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    # macOS TCP_KEEPALIVE = 0x10
+                    if hasattr(socket, 'TCP_KEEPALIVE'):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60)
+                    elif hasattr(socket, 'TCP_KEEPIDLE'):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                    if hasattr(socket, 'TCP_KEEPINTVL'):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    if hasattr(socket, 'TCP_KEEPCNT'):
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    logger.debug(f"{self.account.name} TCP keepalive 已启用 (idle=60s)")
+            except Exception as e:
+                logger.debug(f"{self.account.name} 设置 TCP keepalive 失败（非致命）: {e}")
+
             self._state.connected = True
             self._state.last_connected = time.time()
             self._state.reconnect_count = 0
@@ -207,8 +229,7 @@ class IMAPConnection:
         )
     
     async def disconnect(self) -> None:
-        """断开连接"""
-        self._running = False
+        """断开连接（不改变 idle_listen 的 _running 标志，由 idle_listen 自行管理生命周期）"""
         
         if self._idle_task:
             self._idle_task.cancel()
@@ -265,8 +286,16 @@ class IMAPConnection:
         # 先断开旧连接
         await self.disconnect()
         
-        # 重新连接
-        return await self.connect()
+        # 重新连接。休眠/代理切换后 TLS hello 或 login 偶尔会永久卡住；
+        # 重连路径必须有硬超时，否则 Gmail IDLE 看门狗会被一起拖死。
+        try:
+            return await asyncio.wait_for(self.connect(), timeout=self._connect_timeout)
+        except asyncio.TimeoutError:
+            self._mark_disconnected("connect timeout during reconnect")
+            self._kill_transport()
+            self._connection = None
+            logger.error(f"{self.account.name} 重连超时 ({self._connect_timeout}s)")
+            return False
     
     async def select_folder(self, folder: str = "INBOX") -> bool:
         """
@@ -695,6 +724,15 @@ class IMAPConnection:
     async def idle_listen(self) -> None:
         """
         开始IDLE监听（Gmail专用）
+
+        使用 aioimaplib 的 idle_start() + wait_server_push() API：
+        - idle_start(timeout)：发送 IDLE 命令，收到 "+ idling" 后立即返回，
+          同时设置 call_later 自动停止（超时后自动调 stop_wait_server_push）。
+        - wait_server_push(timeout)：阻塞等待服务器推送（新邮件通知等）。
+        - idle_done()：发送 DONE 结束 IDLE 模式。
+
+        切勿使用 idle()——它会阻塞直到收到 tagged response（即 idle_done 被调用），
+        在没人调 idle_done 的情况下必然超时。
         """
         if self.account.provider != "gmail":
             logger.warning(f"{self.account.name} 不是Gmail，不支持IDLE模式")
@@ -704,23 +742,32 @@ class IMAPConnection:
         idle_timeout = self.account.idle_timeout
         self._state.last_idle_heartbeat = 0.0
         # IDLE 启动退避：连续失败指数退避，成功进入 IDLE 后清零。
-        # 没这个的话 idle() 失败分支会无间隔自旋，一秒刷上千条"进入IDLE状态"后死掉。
-        _MIN_REENTRY_DELAY = 5  # 每次重入 idle() 至少等 5s
+        _MIN_REENTRY_DELAY = 5
         _MAX_REENTRY_DELAY = 60
         _reentry_delay = _MIN_REENTRY_DELAY
         _last_idle_attempt = 0.0
 
         while self._running:
+            idle_future = None
+            has_new_mail = False
             try:
                 if not self.is_connected:
                     logger.info(f"{self.account.name} 重新连接...")
                     if not await self.reconnect():
+                        max_attempts = self._reconnect_config.get("max_attempts", 10)
+                        if self._state.reconnect_count >= max_attempts:
+                            logger.error(f"{self.account.name} 重连耗尽，退出IDLE循环")
+                            break
                         await asyncio.sleep(_reentry_delay)
                         continue
 
-                    await self.select_folder()
+                # 每轮都重新 SELECT INBOX：存量邮件处理阶段的 COPY+EXPUNGE
+                # 可能改变 IMAP 会话状态，直接用脏状态发 IDLE 会失败或挂死。
+                if not await self.select_folder():
+                    await asyncio.sleep(_reentry_delay)
+                    continue
 
-                # 退避：距离上次 idle() 尝试不足 _reentry_delay 就让出事件循环
+                # 退避：距离上次 idle_start 尝试不足 _reentry_delay 就让出事件循环
                 now = time.time()
                 wait = _last_idle_attempt + _reentry_delay - now
                 if wait > 0:
@@ -729,56 +776,107 @@ class IMAPConnection:
 
                 logger.debug(f"{self.account.name} 开始IDLE监听 (超时: {idle_timeout}秒)")
 
-                # 发送 IDLE 命令
-                idle_result = await self._connection.idle()
-                if idle_result.result != "OK":
-                    logger.warning(f"{self.account.name} 进入IDLE失败: {idle_result}")
+                # idle_start：发送 IDLE → 等服务器回复 "+ idling" → 立即返回 Future
+                # timeout 参数控制 call_later 自动停止时间，防止 IDLE 永远挂着
+                try:
+                    idle_future = await self._connection.idle_start(timeout=idle_timeout)
+                except Exception as e:
+                    logger.warning(f"{self.account.name} idle_start() 失败: {e}")
+                    self._mark_disconnected("idle_start failed")
                     _reentry_delay = min(_reentry_delay * 2, _MAX_REENTRY_DELAY)
                     continue
-                # 成功进入 IDLE：清零退避
+
+                if not self._connection.has_pending_idle():
+                    logger.warning(f"{self.account.name} idle_start 未建立 IDLE 状态")
+                    _reentry_delay = min(_reentry_delay * 2, _MAX_REENTRY_DELAY)
+                    continue
+
+                # 成功进入 IDLE：清零退避，记录心跳
                 _reentry_delay = _MIN_REENTRY_DELAY
                 self._state.last_idle_heartbeat = time.time()
+                logger.info(f"{self.account.name} 已进入IDLE模式")
 
-                # 等待IDLE响应或超时
+                # 等待服务器推送（新邮件通知 / IDLE 超时自动停止 / 外部取消）
+                # 每个周期只做一次 wait_server_push，由 idle_start 的 call_later 兜底
+                # wait_server_push 的 timeout 设为 idle_timeout + 30，比 idle_start 的
+                # call_later(idle_timeout) 多 30 秒，确保 call_later 先触发
+                # stop_wait_server_push → wait_server_push 正常返回，避免竞态残留
+                # 外层 asyncio.wait_for(idle_timeout + 60) 做硬超时保险
                 try:
-                    while self._running:
-                        # 检查是否有新数据
-                        response = await self._connection.wait_server_push(timeout=idle_timeout)
+                    try:
+                        response = await asyncio.wait_for(
+                            self._connection.wait_server_push(timeout=idle_timeout + 30),
+                            timeout=idle_timeout + 60,
+                        )
+                    except asyncio.TimeoutError:
+                        # wait_server_push 超时：连接可能已死，退出本轮 IDLE
+                        logger.debug(f"{self.account.name} wait_server_push 超时，退出IDLE")
+                        response = None
 
+                    if response:
+                        # wait_server_push 返回的是 idle_queue 中的原始数据：
+                        # - 服务器推送：list[bytes]，如 [b'* 5 EXISTS']
+                        # - 超时信号：[b'stop_wait_server_push']
+                        # 不是 Response namedtuple，直接遍历即可
                         self._state.last_idle_heartbeat = time.time()
-                        if response:
-                            # 解析 IDLE 响应
-                            for line in getattr(response, "lines", []):
-                                if isinstance(line, bytes):
-                                    resp_str = line.decode(errors="replace")
-                                    if "EXISTS" in resp_str or "RECENT" in resp_str:
-                                        logger.info(f"{self.account.name} 检测到新邮件")
-                                        if self.on_new_mail:
-                                            await self.on_new_mail([])
-
-                except asyncio.TimeoutError:
-                    # IDLE 超时，发送 NOOP 保持连接
-                    self._state.last_idle_heartbeat = time.time()
-                    logger.debug(f"{self.account.name} IDLE超时，发送 NOOP")
-                    self._connection.idle_done()
-                    await self._connection.noop()
-
-                    # 检查是否超时需要重连
-                    if self._state.last_connected:
-                        elapsed = time.time() - self._state.last_connected
-                        if elapsed > self.account.reconnect_timeout:
-                            logger.warning(f"{self.account.name} 超过重连超时时间")
-                            if self.on_idle_timeout:
-                                await self.on_idle_timeout()
-                            continue
+                        lines = response if isinstance(response, list) else getattr(response, "lines", [])
+                        is_stop_signal = False
+                        for line in lines:
+                            if isinstance(line, bytes):
+                                resp_str = line.decode(errors="replace")
+                                if "stop_wait_server_push" in resp_str:
+                                    is_stop_signal = True
+                                    continue
+                                if "EXISTS" in resp_str or "RECENT" in resp_str:
+                                    logger.info(f"{self.account.name} 检测到新邮件")
+                                    has_new_mail = True
+                        if is_stop_signal:
+                            logger.debug(f"{self.account.name} IDLE 周期结束，准备轮转")
+                    else:
+                        # 空响应（不应出现）
+                        logger.debug(f"{self.account.name} IDLE 空响应，准备轮转")
+                    # idle_start 的 call_later 超时后会自动 stop_wait_server_push，
+                    # wait_server_push 返回 STOP_WAIT_SERVER_PUSH 标记，本轮 IDLE 结束
                 finally:
+                    # 无论什么路径退出，都确保发送 DONE 结束 IDLE
                     try:
                         self._connection.idle_done()
                     except Exception:
                         pass
+                    # 等待 idle Future 完成（获取 tagged response）
+                    if idle_future is not None and not idle_future.done():
+                        try:
+                            await asyncio.wait_for(idle_future, timeout=5)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+
+                # IMAP IDLE 状态下不能发送 SELECT/FETCH。先 DONE 退出 IDLE，
+                # 再把新邮件信号交给抓取器，避免 Gmail 连接在唤醒后被并发命令卡死。
+                if has_new_mail and self.on_new_mail:
+                    await self.on_new_mail([])
+
+                # IDLE 正常轮转后发 NOOP 保活
+                logger.debug(f"{self.account.name} IDLE 轮转结束，发 NOOP 保活")
+                try:
+                    await self._connection.noop()
+                except Exception:
+                    pass
+
+                # 检查是否需要重连
+                if self._state.last_connected:
+                    elapsed = time.time() - self._state.last_connected
+                    if elapsed > self.account.reconnect_timeout:
+                        logger.warning(f"{self.account.name} 超过重连超时时间")
+                        if self.on_idle_timeout:
+                            await self.on_idle_timeout()
 
             except asyncio.CancelledError:
                 logger.info(f"{self.account.name} IDLE监听被取消")
+                # 确保退出 IDLE
+                try:
+                    self._connection.idle_done()
+                except Exception:
+                    pass
                 break
             except Exception as e:
                 logger.error(f"{self.account.name} IDLE监听出错: {e}")
@@ -797,6 +895,21 @@ class IMAPConnection:
         """force_restart_idle 完成（成功或失败）后清掉标记，避免 watchdog 反复触发。"""
         self._state.restart_in_progress = False
 
+    def _kill_transport(self) -> None:
+        """直接关闭底层 SSL transport，打断阻塞的 socket 读写。
+
+        当 IDLE task 卡在 aioimaplib 的 socket read 上时，优雅的
+        logout()/cancel() 都无法让它退出；只有关掉 transport 才能让
+        底层 StreamReader 收到 EOF，从而让 await 返回。
+        """
+        if self._connection is not None:
+            try:
+                transport = self._connection.protocol.transport
+                transport.close()
+                logger.debug(f"{self.account.name} 已强制关闭底层 transport")
+            except Exception:
+                pass
+
     async def force_restart_idle(self) -> None:
         """
         看门狗调用：终止当前 IDLE 协程、断连、清状态，让外层用新 task 接管。
@@ -808,15 +921,10 @@ class IMAPConnection:
             # 让 idle_listen 的外层 while 退出
             self._running = False
 
-            # 强制断连（如果 idle() 阻塞在底层 socket，这里会把它打掉）
-            try:
-                if self._connection is not None:
-                    await asyncio.wait_for(
-                        self._connection.logout(),
-                        timeout=5,
-                    )
-            except Exception:
-                pass
+            # 直接关闭底层 transport（比 logout 快且可靠）
+            # logout() 在连接僵死时会卡住，transport.close() 直接中断 socket
+            self._kill_transport()
+
             self._state.connected = False
             self._connection = None
             self._state.last_connected = None
@@ -874,7 +982,11 @@ class ConnectionManager:
         results = {}
         
         async def connect_one(conn: IMAPConnection) -> tuple:
-            success = await conn.connect()
+            try:
+                success = await asyncio.wait_for(conn.connect(), timeout=conn._connect_timeout)
+            except asyncio.TimeoutError:
+                logger.error(f"连接 {conn.account.name} 超时 ({conn._connect_timeout}s)")
+                success = False
             return conn.account.email, success
         
         # 并发连接所有账户
@@ -917,8 +1029,10 @@ class ConnectionManager:
         tasks = [
             reconnect_one(conn)
             for conn in self._connections.values()
-            if not conn.is_connected
+            if not conn.is_connected and conn.account.provider != "gmail"
         ]
+        # 跳过 Gmail：其重连由 IMAPConnection.idle_listen 自治（看门狗触发的
+        # self.reconnect() 路径），manager 层不应横插一脚。
         if not tasks:
             return results
 

@@ -56,7 +56,7 @@ accounts:
     username: "{{IMAP_USER_GMAIL}}"
     password: "{{IMAP_PASS_GMAIL}}"
     folder_prefix: ""
-    idle_timeout_seconds: 540
+    idle_timeout_seconds: 180
     reconnect_timeout_seconds: 1800
     initial_days: 30
     batch_size: 50

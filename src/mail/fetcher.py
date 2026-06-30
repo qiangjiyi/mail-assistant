@@ -6,7 +6,7 @@
 import asyncio
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dateutil import parser as date_parser
 from loguru import logger
@@ -14,6 +14,7 @@ from loguru import logger
 from .connection import IMAPConnection, IMAPAccount
 from .parser import MailParser, EmailData
 from ..config import get_config
+from ..storage.state import StateManager
 
 
 class MailFetcher:
@@ -27,6 +28,7 @@ class MailFetcher:
         connection: IMAPConnection,
         parser: MailParser,
         on_emails_fetched: Optional[Callable[[List[EmailData]], Awaitable[None]]] = None,
+        state_manager: Optional[Any] = None,
     ):
         """
         初始化邮件抓取器
@@ -39,6 +41,7 @@ class MailFetcher:
         self.connection = connection
         self.parser = parser
         self.on_emails_fetched = on_emails_fetched
+        self._state_manager = state_manager
         
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
@@ -69,6 +72,7 @@ class MailFetcher:
             return
         
         self._running = True
+        await self._load_last_uid()
         fetch_interval = self.account.fetch_interval
         
         logger.info(f"{self.account.name} 开始轮询模式 (间隔: {fetch_interval}秒)")
@@ -99,13 +103,18 @@ class MailFetcher:
         
         logger.info(f"{self.account.name} 轮询结束")
     
-    async def start_idle(self) -> asyncio.Task:
+    async def start_idle(
+        self,
+        skip_existing: bool = False,
+        catch_up: bool = False,
+    ) -> asyncio.Task:
         """开始IDLE模式（Gmail），返回后台 task 给上层管理生命周期。"""
         if self.account.provider != "gmail":
             logger.warning(f"{self.account.name} 不是Gmail，无法使用IDLE模式")
             return None
 
         self._running = True
+        await self._load_last_uid()
 
         # 设置回调
         self.connection.on_new_mail = self._on_idle_new_mail
@@ -115,13 +124,25 @@ class MailFetcher:
 
         async def _run():
             try:
-                # 首次同步存量邮件
-                if self._fetcher_config.get("process_existing", True):
-                    emails = await self._fetch_existing_emails()
-                    # 存量邮件解析后也要进入处理管线（分类/归档/通知），
-                    # 否则首次启动看到的存量会被静默丢弃。
-                    if emails and self.on_emails_fetched:
-                        await self.on_emails_fetched(emails)
+                # Gmail 已有 last_uid 时只做增量补抓。不能再按日期做存量扫描，
+                # 否则 Gmail 里 Header Date 很早但仍留在 INBOX 的旧邮件会被当作新邮件推送。
+                if not skip_existing and self._fetcher_config.get("process_existing", True):
+                    if self._last_uid:
+                        await self._catch_up_new_emails()
+                    else:
+                        emails = await self._fetch_existing_emails()
+                        # 只有没有 last_uid 的首次启动才处理存量。
+                        if emails and self.on_emails_fetched:
+                            await self.on_emails_fetched(emails)
+                            parsed_uids = [email.uid for email in emails if email.uid]
+                            max_uid = self._max_uid(parsed_uids)
+                            if max_uid:
+                                await self._remember_last_uid(max_uid)
+
+                # 看门狗重启时，旧 IDLE 连接可能已经错过 EXISTS 推送。
+                # 进入新 IDLE 前按 last_uid 做一次增量补抓，避免邮件一直漏在 INBOX。
+                if catch_up:
+                    await self._catch_up_new_emails()
 
                 # 开始IDLE监听（阻塞直到被 cancel 或自然结束）
                 await self.connection.idle_listen()
@@ -129,7 +150,8 @@ class MailFetcher:
                 logger.info(f"{self.account.name} IDLE task 被取消")
                 raise
             finally:
-                self._running = False
+                if asyncio.current_task() is self._idle_task:
+                    self._running = False
 
         self._idle_task = asyncio.create_task(_run(), name=f"idle:{self.account.email}")
         self._record_idle_start()
@@ -157,13 +179,25 @@ class MailFetcher:
         logger.warning(f"{self.account.name} IDLE 心跳超时，看门狗强制重启")
         self.connection.mark_idle_unhealthy()
 
-        # 取消旧 task
+        # 先关闭底层 transport：让卡在 socket 读写的 idle task 立即收到 EOF，
+        # 否则 cancel 后的 await 会永远挂住（底层 aioimaplib 不响应取消）。
+        try:
+            self.connection._kill_transport()
+        except Exception:
+            pass
+
+        # 取消旧 task。这里不能用 wait_for(task)，因为底层 socket 读写不响应取消时，
+        # wait_for 也会继续等待 task 真正取消完成，反而把看门狗一起卡住。
         if self._idle_task and not self._idle_task.done():
             self._idle_task.cancel()
-            try:
-                await self._idle_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            done, pending = await asyncio.wait({self._idle_task}, timeout=10)
+            for task in done:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if pending:
+                logger.warning(f"{self.account.name} 旧IDLE task 10秒内未退出，放弃等待")
 
         # 断连、清状态
         try:
@@ -171,8 +205,28 @@ class MailFetcher:
         except Exception as e:
             logger.error(f"{self.account.name} 强制断连失败: {e}")
 
-        # 起新 task（start_idle 内部会用 _running 重新置 True）
-        return await self.start_idle()
+        # 重置重连计数：看门狗重启是新周期，不应继承旧 task 的累积重连次数
+        self.connection._state.reconnect_count = 0
+
+        # 起新 task（跳过存量同步，但先做增量补抓）
+        return await self.start_idle(skip_existing=True, catch_up=True)
+
+    async def _catch_up_new_emails(self) -> List[EmailData]:
+        """重建 IDLE 前补抓上次 UID 之后的新邮件。"""
+        try:
+            if not self.connection.is_connected:
+                logger.info(f"{self.account.name} IDLE重启后补抓前先重连")
+                if not await self.connection.reconnect():
+                    logger.warning(f"{self.account.name} IDLE重启补抓失败：无法重连")
+                    return []
+
+            emails = await self._fetch_new_emails()
+            if emails:
+                logger.info(f"{self.account.name} IDLE重启补抓到 {len(emails)} 封新邮件")
+            return emails
+        except Exception as e:
+            logger.error(f"{self.account.name} IDLE重启补抓异常: {type(e).__name__}: {e}")
+            return []
     
     async def _on_idle_new_mail(self, uids: List[str]) -> None:
         """IDLE模式检测到新邮件"""
@@ -215,7 +269,8 @@ class MailFetcher:
             # 使用 UNSEEN 或 SINCE <date>
             if self._last_uid:
                 # 从上次UID之后开始
-                uids = await self.connection.search(f"UID {self._last_uid}:*")
+                uids = await self.connection.search(f"UID {self._next_uid_criteria(self._last_uid)}:*")
+                uids = self._filter_uids_after_last(uids)
             else:
                 # 首次获取所有未读邮件
                 uids = await self.connection.search("UNSEEN")
@@ -228,14 +283,16 @@ class MailFetcher:
             
             # 解析邮件
             emails = await self._fetch_and_parse_emails(uids)
-            
-            # 更新最后UID
-            if uids:
-                self._last_uid = uids[-1]
-            
+
             # 触发回调
             if emails and self.on_emails_fetched:
                 await self.on_emails_fetched(emails)
+
+            # 只在实际解析成功后推进 UID，避免 SELECT/FETCH 超时后跳过邮件。
+            parsed_uids = [email.uid for email in emails if email.uid]
+            max_uid = self._max_uid(parsed_uids)
+            if max_uid:
+                await self._remember_last_uid(max_uid)
             
             return emails
             
@@ -346,6 +403,78 @@ class MailFetcher:
             logger.error(f"批量获取邮件失败: {e}")
         
         return emails
+
+    async def _load_last_uid(self) -> None:
+        """从持久化状态恢复最后处理 UID，服务重启后继续增量抓取。"""
+        if self._last_uid or self._state_manager is None:
+            return
+
+        try:
+            last_uid = await self._state_manager.get_last_uid(self.account.email)
+        except Exception as e:
+            logger.debug(f"{self.account.name} 读取 last_uid 失败: {e}")
+            return
+
+        if last_uid:
+            self._last_uid = str(last_uid)
+            logger.debug(f"{self.account.name} 恢复 last_uid: {self._last_uid}")
+
+    async def _remember_last_uid(self, uid: str) -> None:
+        """更新内存和持久化 last UID。"""
+        uid = str(uid)
+        if self._last_uid and not self._uid_is_after(uid, self._last_uid):
+            logger.debug(
+                f"{self.account.name} 忽略倒退 last_uid: {uid} <= {self._last_uid}"
+            )
+            return
+
+        self._last_uid = uid
+
+        if self._state_manager is None:
+            return
+
+        try:
+            await self._state_manager.set_last_uid(self.account.email, self._last_uid)
+        except Exception as e:
+            logger.debug(f"{self.account.name} 保存 last_uid 失败: {e}")
+
+    @staticmethod
+    def _next_uid_criteria(last_uid: str) -> str:
+        """返回 IMAP UID 搜索起点，避免重复抓取 last_uid 本身。"""
+        try:
+            return str(int(last_uid) + 1)
+        except (TypeError, ValueError):
+            return str(last_uid)
+
+    def _filter_uids_after_last(self, uids: List[str]) -> List[str]:
+        """本地兜底过滤，防止 IMAP 服务端/库返回小于 last_uid 的旧 UID。"""
+        if not self._last_uid:
+            return uids
+
+        filtered = [uid for uid in uids if self._uid_is_after(uid, self._last_uid)]
+        skipped = len(uids) - len(filtered)
+        if skipped:
+            logger.warning(
+                f"{self.account.name} 跳过 {skipped} 个不大于 last_uid "
+                f"{self._last_uid} 的旧 UID"
+            )
+        return filtered
+
+    @staticmethod
+    def _uid_is_after(candidate: str, current: str) -> bool:
+        """判断 candidate 是否比 current 更新。委托给 StateManager 同名实现。"""
+        return StateManager._is_uid_after(candidate, current)
+
+    @classmethod
+    def _max_uid(cls, uids: List[str]) -> Optional[str]:
+        """返回 UID 列表中的最大值。"""
+        if not uids:
+            return None
+
+        try:
+            return str(max(int(uid) for uid in uids))
+        except (TypeError, ValueError):
+            return max(str(uid) for uid in uids)
 
     @staticmethod
     def _looks_like_rfc822_payload(line: bytes | bytearray) -> bool:

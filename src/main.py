@@ -118,6 +118,7 @@ class MailAssistantService:
                     connection=connection,
                     parser=parser,
                     on_emails_fetched=self._on_emails_fetched,
+                    state_manager=self._state_manager,
                 )
                 self._fetchers[email] = fetcher
         
@@ -153,6 +154,10 @@ class MailAssistantService:
             logger.info("存量邮件处理完成，服务退出")
             await self.stop()
             return
+
+        # 启动监听前先回收历史遗留的半处理邮件：
+        # 这些邮件 UID 已经不大于 last_uid，常规增量抓取不会再看到它们。
+        await self._recover_stale_unprocessed_emails()
         
         # 启动邮件抓取任务
         await self._start_fetchers()
@@ -260,9 +265,6 @@ class MailAssistantService:
 
             connection = fetcher.connection
             last_beat = connection._state.last_idle_heartbeat
-            if last_beat <= 0:
-                # 还没建立过心跳，跳过
-                continue
 
             if connection._state.restart_in_progress:
                 # 已经在重启流程中
@@ -270,7 +272,26 @@ class MailAssistantService:
 
             recent_restarts = fetcher.recent_idle_starts(idle_restart_window_seconds)
 
-            if now - last_beat <= idle_stale_threshold:
+            if last_beat <= 0:
+                # 从未建立过心跳：检查 IDLE task 已启动多久。
+                # 如果 task 启动超过 idle_stale_threshold 但心跳仍为 0，
+                # 说明 idle() 调用本身挂死了——看门狗必须介入。
+                # 如果 IDLE task 根本没在跑（重连耗尽退出等），也要重建。
+                idle_starts = fetcher._idle_start_log
+                idle_task_alive = fetcher._idle_task is not None and not fetcher._idle_task.done()
+                if not idle_starts and not idle_task_alive:
+                    # 没有 task 也没有启动记录：IDLE 已死亡，重建
+                    logger.warning(f"Gmail IDLE task 已退出，重新启动: {email}")
+                elif not idle_starts:
+                    continue
+                elif idle_task_alive:
+                    task_age = now - idle_starts[-1]
+                    if task_age < idle_stale_threshold:
+                        continue  # 刚启动，再等等
+                    logger.warning(
+                        f"Gmail IDLE 从未建立心跳 ({int(task_age)}s)，强制重启: {email}"
+                    )
+            elif now - last_beat <= idle_stale_threshold:
                 # 心跳还新鲜，但 watchdog 短时间内反复重启过，判定为重启循环
                 if recent_restarts > idle_restart_threshold:
                     logger.warning(
@@ -347,6 +368,45 @@ class MailAssistantService:
         except Exception as e:
             logger.error(f"处理存量邮件失败 {email}: {e}")
             await self._state_manager.increment_errors()
+
+    async def _recover_stale_unprocessed_emails(self) -> None:
+        """回收数据库中 UID 已落后于 last_uid 的未处理邮件。"""
+        if not self._database or not self._state_manager:
+            return
+
+        for account_email, fetcher in self._fetchers.items():
+            try:
+                last_uid = await self._state_manager.get_last_uid(account_email)
+                if not last_uid:
+                    continue
+
+                rows = await self._database.get_unprocessed_emails(
+                    account_email=account_email,
+                    limit=100,
+                )
+                stale_uids = [
+                    str(row["uid"])
+                    for row in rows
+                    if row.get("uid")
+                    and not MailFetcher._uid_is_after(str(row["uid"]), str(last_uid))
+                ]
+
+                if not stale_uids:
+                    continue
+
+                logger.warning(
+                    f"{account_email}: 发现 {len(stale_uids)} 封 UID <= last_uid "
+                    f"{last_uid} 的未处理遗留邮件，开始回收"
+                )
+                emails = await fetcher._fetch_and_parse_emails(stale_uids)
+                if emails:
+                    await self._process_emails(
+                        emails,
+                        send_individual_notifications=False,
+                    )
+            except Exception as e:
+                logger.error(f"回收未处理遗留邮件失败 {account_email}: {e}")
+                await self._state_manager.increment_errors()
     
     async def _on_emails_fetched(self, emails: List) -> None:
         """

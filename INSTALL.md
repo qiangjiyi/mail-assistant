@@ -2,9 +2,8 @@
 
 ## 准备工作
 
-`com.mailassistant.service.plist` 中的路径默认是占位符 `/path/to/mail-assistant`，
-首次安装前请将其替换为本项目在你机器上的真实绝对路径（共 5 处）。
-同时确认 `uv` 路径（默认 `/opt/homebrew/bin/uv`），如不同可在运行命令时用 `UV_BIN=/path/to/uv` 指定。
+`scripts/mailctl.sh` 安装 launchd 服务时会根据本项目所在路径自动渲染 plist，无需手动维护。
+`uv` 路径默认 `/opt/homebrew/bin/uv`，如不同可用 `UV_BIN=/path/to/uv scripts/mailctl.sh start` 指定。
 
 ## 安装步骤
 
@@ -56,5 +55,4 @@ scripts/mailctl.sh restart
 ## 注意事项
 
 1. 确保 `.env` 文件已正确配置
-2. 确保 Python 路径和项目路径正确
-3. 如果修改了 plist 文件，需要先卸载再重新加载
+2. 移动项目目录后，运行 `scripts/mailctl.sh restart` 即可，plist 会按新路径自动重新渲染

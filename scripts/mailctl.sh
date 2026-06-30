@@ -4,7 +4,6 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="com.mailassistant.service"
 PLIST_NAME="${LABEL}.plist"
-SOURCE_PLIST="${PROJECT_ROOT}/${PLIST_NAME}"
 TARGET_PLIST="${HOME}/Library/LaunchAgents/${PLIST_NAME}"
 UV_BIN="${UV_BIN:-/opt/homebrew/bin/uv}"
 
@@ -49,9 +48,60 @@ run_foreground() {
   "${UV_BIN}" run python run.py "$@"
 }
 
+render_and_write_plist() {
+  cat > "$1" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mailassistant.service</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${UV_BIN}</string>
+        <string>run</string>
+        <string>python</string>
+        <string>${PROJECT_ROOT}/run.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${PROJECT_ROOT}</string>
+
+    <key>StandardOutPath</key>
+    <string>${PROJECT_ROOT}/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${PROJECT_ROOT}/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>${PROJECT_ROOT}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
+EOF
+}
+
 install_service() {
+  require_uv
   mkdir -p "${HOME}/Library/LaunchAgents"
-  cp "${SOURCE_PLIST}" "${TARGET_PLIST}"
+  render_and_write_plist "${TARGET_PLIST}"
   launchctl unload "${TARGET_PLIST}" >/dev/null 2>&1 || true
   launchctl load "${TARGET_PLIST}"
   echo "已安装并加载服务: ${LABEL}"

@@ -87,8 +87,23 @@ class StateManager:
     async def set_last_uid(self, account_email: str, uid: str) -> None:
         """设置账户最后处理的UID"""
         key = f"last_uid_{account_email}"
+        current = self._state.get(key)
+        uid = str(uid)
+
+        if current is not None and not self._is_uid_after(uid, str(current)):
+            logger.debug(f"忽略倒退 last_uid: {account_email} {uid} <= {current}")
+            return
+
         self._state[key] = uid
         await self._save_state()
+
+    @staticmethod
+    def _is_uid_after(candidate: str, current: str) -> bool:
+        """判断 candidate 是否比 current 更新。"""
+        try:
+            return int(candidate) > int(current)
+        except (TypeError, ValueError):
+            return str(candidate) > str(current)
     
     async def get_last_sync_time(self, account_email: str) -> Optional[float]:
         """获取账户最后同步时间"""

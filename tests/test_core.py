@@ -4,6 +4,7 @@
 
 import pytest
 import sys
+import asyncio
 from pathlib import Path
 
 # 添加项目根目录到路径
@@ -104,6 +105,208 @@ class TestMailFetcher:
         assert MailFetcher._looks_like_rfc822_payload(
             bytearray(b"From: a@example.com\r\nSubject: hello\r\n\r\nbody")
         ) is True
+
+    def test_next_uid_criteria_skips_last_seen_uid(self):
+        """测试增量搜索从 last_uid 的下一封开始"""
+        from src.mail.fetcher import MailFetcher
+
+        assert MailFetcher._next_uid_criteria("123") == "124"
+        assert MailFetcher._next_uid_criteria("abc") == "abc"
+
+    def test_filter_uids_after_last_skips_stale_uids(self):
+        """测试本地过滤会跳过不大于 last_uid 的旧 UID。"""
+        from src.mail.connection import IMAPAccount, IMAPConnection
+        from src.mail.fetcher import MailFetcher
+        from src.mail.parser import MailParser
+
+        account = IMAPAccount(
+            name="Gmail",
+            provider="gmail",
+            email="user@example.com",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+            username="user@example.com",
+            password="secret",
+        )
+        fetcher = MailFetcher(IMAPConnection(account), MailParser())
+        fetcher._last_uid = "11312"
+
+        assert fetcher._filter_uids_after_last(["11195", "11312", "11313"]) == ["11313"]
+
+    @pytest.mark.asyncio
+    async def test_load_and_remember_last_uid(self):
+        """测试抓取器会从状态文件恢复并保存 last_uid"""
+        from src.mail.connection import IMAPAccount, IMAPConnection
+        from src.mail.fetcher import MailFetcher
+        from src.mail.parser import MailParser
+
+        class FakeStateManager:
+            def __init__(self):
+                self.saved = None
+
+            async def get_last_uid(self, account_email):
+                return "42"
+
+            async def set_last_uid(self, account_email, uid):
+                self.saved = (account_email, uid)
+
+        account = IMAPAccount(
+            name="Gmail",
+            provider="gmail",
+            email="user@example.com",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+            username="user@example.com",
+            password="secret",
+        )
+        fetcher = MailFetcher(
+            IMAPConnection(account),
+            MailParser(),
+            state_manager=FakeStateManager(),
+        )
+
+        await fetcher._load_last_uid()
+        assert fetcher._last_uid == "42"
+
+        await fetcher._remember_last_uid("43")
+        assert fetcher._last_uid == "43"
+        assert fetcher._state_manager.saved == ("user@example.com", "43")
+
+        await fetcher._remember_last_uid("41")
+        assert fetcher._last_uid == "43"
+        assert fetcher._state_manager.saved == ("user@example.com", "43")
+
+    @pytest.mark.asyncio
+    async def test_idle_restart_catches_up_before_listening(self):
+        """测试 Gmail IDLE 重启后会先补抓漏掉的新 UID。"""
+        from src.mail.connection import IMAPAccount
+        from src.mail.fetcher import MailFetcher
+        from src.mail.parser import MailParser
+
+        account = IMAPAccount(
+            name="Gmail",
+            provider="gmail",
+            email="user@example.com",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+            username="user@example.com",
+            password="secret",
+        )
+
+        class FakeConnection:
+            def __init__(self):
+                self.account = account
+                self.connected = False
+                self.events = []
+                self.on_new_mail = None
+                self.on_idle_timeout = None
+
+            @property
+            def is_connected(self):
+                return self.connected
+
+            async def reconnect(self):
+                self.events.append("reconnect")
+                self.connected = True
+                return True
+
+            async def select_folder(self):
+                self.events.append("select")
+                return True
+
+            async def search(self, criteria):
+                self.events.append(("search", criteria))
+                return []
+
+            async def idle_listen(self):
+                self.events.append("idle")
+
+        class FakeStateManager:
+            async def get_last_uid(self, account_email):
+                return "11310"
+
+            async def set_last_uid(self, account_email, uid):
+                pass
+
+        connection = FakeConnection()
+        fetcher = MailFetcher(
+            connection,
+            MailParser(),
+            state_manager=FakeStateManager(),
+        )
+
+        task = await fetcher.start_idle(skip_existing=True, catch_up=True)
+        await task
+
+        assert connection.events == [
+            "reconnect",
+            "select",
+            ("search", "UID 11311:*"),
+            "idle",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gmail_start_with_last_uid_uses_incremental_fetch(self):
+        """测试 Gmail 正常启动时已有 last_uid 就不再扫描存量邮件。"""
+        from src.mail.connection import IMAPAccount
+        from src.mail.fetcher import MailFetcher
+        from src.mail.parser import MailParser
+
+        account = IMAPAccount(
+            name="Gmail",
+            provider="gmail",
+            email="user@example.com",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+            username="user@example.com",
+            password="secret",
+        )
+
+        class FakeConnection:
+            def __init__(self):
+                self.account = account
+                self.connected = True
+                self.events = []
+                self.on_new_mail = None
+                self.on_idle_timeout = None
+
+            @property
+            def is_connected(self):
+                return self.connected
+
+            async def select_folder(self):
+                self.events.append("select")
+                return True
+
+            async def search(self, criteria):
+                self.events.append(("search", criteria))
+                return []
+
+            async def idle_listen(self):
+                self.events.append("idle")
+
+        class FakeStateManager:
+            async def get_last_uid(self, account_email):
+                return "11312"
+
+            async def set_last_uid(self, account_email, uid):
+                pass
+
+        connection = FakeConnection()
+        fetcher = MailFetcher(
+            connection,
+            MailParser(),
+            state_manager=FakeStateManager(),
+        )
+
+        task = await fetcher.start_idle()
+        await task
+
+        assert connection.events == [
+            "select",
+            ("search", "UID 11313:*"),
+            "idle",
+        ]
 
 
 class TestIMAPConnection:
@@ -279,6 +482,69 @@ class TestIMAPConnection:
         connection._state.connected = True
 
         assert await connection.get_special_use_folder("\\Junk") == "[Gmail]/垃圾邮件"
+
+    @pytest.mark.asyncio
+    async def test_idle_new_mail_callback_runs_after_idle_done(self):
+        """测试 Gmail 新邮件回调会在退出 IDLE 后执行"""
+        from src.mail.connection import IMAPAccount, IMAPConnection
+
+        class FakeResponse:
+            result = "OK"
+
+        class FakeProtocol:
+            state = "SELECTED"
+
+        class FakeIMAP:
+            def __init__(self):
+                self.protocol = FakeProtocol()
+                self.idle_done_called = False
+                self.noop_called = False
+
+            async def select(self, folder):
+                return FakeResponse()
+
+            async def idle_start(self, timeout):
+                future = asyncio.get_running_loop().create_future()
+                future.set_result(FakeResponse())
+                return future
+
+            def has_pending_idle(self):
+                return True
+
+            async def wait_server_push(self, timeout):
+                return [b"* 2 EXISTS"]
+
+            def idle_done(self):
+                self.idle_done_called = True
+
+            async def noop(self):
+                self.noop_called = True
+
+        account = IMAPAccount(
+            name="Gmail",
+            provider="gmail",
+            email="user@example.com",
+            imap_host="imap.gmail.com",
+            imap_port=993,
+            username="user@example.com",
+            password="secret",
+        )
+        connection = IMAPConnection(account)
+        fake_imap = FakeIMAP()
+        callback_seen_idle_done = []
+
+        async def on_new_mail(_uids):
+            callback_seen_idle_done.append(fake_imap.idle_done_called)
+            connection._running = False
+
+        connection._connection = fake_imap
+        connection._state.connected = True
+        connection.on_new_mail = on_new_mail
+
+        await connection.idle_listen()
+
+        assert callback_seen_idle_done == [True]
+        assert fake_imap.noop_called is True
 
 
 class TestRuleEngine:
@@ -574,6 +840,76 @@ class TestDatabase:
         await db.close()
 
 
+class TestMailAssistantService:
+    """主服务编排测试"""
+
+    @pytest.mark.asyncio
+    async def test_recover_stale_unprocessed_emails_fetches_uids_before_last_uid(self):
+        """测试 UID 已落后于 last_uid 的未处理邮件会被回收处理。"""
+        from src.main import MailAssistantService
+        from src.mail.parser import EmailData
+
+        class FakeStateManager:
+            def __init__(self):
+                self.errors = 0
+
+            async def get_last_uid(self, account_email):
+                return "100"
+
+            async def increment_errors(self):
+                self.errors += 1
+
+        class FakeDatabase:
+            async def get_unprocessed_emails(self, account_email=None, limit=100):
+                return [
+                    {"uid": "98", "subject": "stale"},
+                    {"uid": "101", "subject": "newer"},
+                ]
+
+        class FakeFetcher:
+            def __init__(self):
+                self.fetched_uids = None
+
+            async def _fetch_and_parse_emails(self, uids):
+                self.fetched_uids = uids
+                return [
+                    EmailData(
+                        message_id="m-98",
+                        uid="98",
+                        account_email="user@example.com",
+                        sender="sender",
+                        sender_email="sender@example.com",
+                        recipients=["user@example.com"],
+                        subject="stale",
+                        date=None,
+                        date_str="",
+                        body_plain="body",
+                        body_html="",
+                        body_preview="body",
+                        has_attachments=False,
+                    )
+                ]
+
+        service = MailAssistantService()
+        fetcher = FakeFetcher()
+        processed = []
+
+        async def fake_process_emails(emails, send_individual_notifications=True):
+            processed.extend(emails)
+            assert send_individual_notifications is False
+            return emails
+
+        service._database = FakeDatabase()
+        service._state_manager = FakeStateManager()
+        service._fetchers = {"user@example.com": fetcher}
+        service._process_emails = fake_process_emails
+
+        await service._recover_stale_unprocessed_emails()
+
+        assert fetcher.fetched_uids == ["98"]
+        assert [email.uid for email in processed] == ["98"]
+
+
 class TestStateManager:
     """状态管理器测试"""
     
@@ -592,6 +928,10 @@ class TestStateManager:
         
         # 测试账户UID
         await manager.set_last_uid("test@example.com", "12345")
+        uid = await manager.get_last_uid("test@example.com")
+        assert uid == "12345"
+
+        await manager.set_last_uid("test@example.com", "12344")
         uid = await manager.get_last_uid("test@example.com")
         assert uid == "12345"
         
